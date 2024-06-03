@@ -1,0 +1,464 @@
+goroutines (go func() {...}()):
+
+The go keyword is used to start a new goroutine, which is a lightweight thread managed by the Go runtime.
+In this code, a new goroutine is started inside a loop (for i := 0; i < 4; i++) to execute a function. 
+
+channels (make(chan func(), 10)):
+
+Channels are used for communication and synchronization between goroutines.
+The make(chan func(), 10) statement creates a buffered channel capable of holding 10 elements of type func().
+Buffered channels allow sending and receiving messages asynchronously, up to the specified capacity without blocking. 
+Closure (func() {...}():
+
+A closure is a function value that references variables from outside its body.
+In this code, an anonymous function (closure) is defined and immediately executed (func() {...}()) inside the go statement. 
+Range over channel (for f := range cnp {...}):
+
+The range keyword is used to iterate over elements received from a channel until it's closed.
+Inside the loop, each received function is executed (f()).  
+
+Use-cases:
+This pattern is commonly used for concurrent processing of tasks where goroutines process work items sent through channels.
+Buffered channels are useful when you want to decouple the sender and receiver, allowing the sender to continue without waiting for the receiver to process the data. 
+Significance of the for loop with 4 iterations:
+The for loop with 4 iterations starts 4 goroutines, each handling tasks sent through the channel concurrently. This allows for parallel processing of tasks, potentially improving performance by utilizing multiple CPU cores. 
+
+ChatGPT
+
+Write an eBPF code to drop the TCP packets on a port (def: 4040). Additionally, if you can make the port number configurable from the userspace, that will be a big plus.
+ChatGPT
+Creating an eBPF program to drop TCP packets on a specified port and making the port configurable from userspace involves writing both the eBPF code and the userspace code. The eBPF code will be responsible for the packet filtering, while the userspace code will handle the configuration.
+
+eBPF Code
+We'll use xdp (eXpress Data Path) for this task since it allows packet processing at a very early stage in the networking stack. Here is the eBPF code:
+
+c
+Copy code
+#include <linux/bpf.h>
+#include <linux/if_ether.h>
+#include <linux/ip.h>
+#include <linux/tcp.h>
+#include <bpf/bpf_helpers.h>
+
+// Map to hold the port number, initialized with default value 4040
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, int);
+    __type(value, __u16);
+} port_map SEC(".maps");
+
+SEC("xdp")
+int xdp_drop_tcp_port(struct xdp_md *ctx) {
+    void *data_end = (void *)(long)ctx->data_end;
+    void *data = (void *)(long)ctx->data;
+
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end)
+        return XDP_PASS;
+
+    if (eth->h_proto != bpf_htons(ETH_P_IP))
+        return XDP_PASS;
+
+    struct iphdr *ip = data + sizeof(struct ethhdr);
+    if ((void *)(ip + 1) > data_end)
+        return XDP_PASS;
+
+    if (ip->protocol != IPPROTO_TCP)
+        return XDP_PASS;
+
+    struct tcphdr *tcp = (void *)ip + (ip->ihl * 4);
+    if ((void *)(tcp + 1) > data_end)
+        return XDP_PASS;
+
+    // Retrieve the port to block from the port_map
+    int key = 0;
+    __u16 *port = bpf_map_lookup_elem(&port_map, &key);
+    if (!port)
+        return XDP_PASS;
+
+    if (tcp->dest == bpf_htons(*port)) {
+        return XDP_DROP;
+    }
+
+    return XDP_PASS;
+}
+
+char _license[] SEC("license") = "GPL";
+Userspace Code
+The userspace code is responsible for loading the eBPF program and configuring the port number.
+
+c
+Copy code
+#include <stdio.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <linux/bpf.h>
+#include <bpf/libbpf.h>
+
+#define PATH_MAX 4096
+
+int main(int argc, char **argv) {
+    if (argc != 3) {
+        fprintf(stderr, "Usage: %s <interface> <port>\n", argv[0]);
+        return 1;
+    }
+
+    char *interface = argv[1];
+    __u16 port = atoi(argv[2]);
+
+    struct bpf_object *obj;
+    int prog_fd;
+    int port_map_fd;
+    char filename[PATH_MAX];
+
+    snprintf(filename, PATH_MAX, "%s_kern.o", argv[0]);
+
+    obj = bpf_object__open_file(filename, NULL);
+    if (libbpf_get_error(obj)) {
+        fprintf(stderr, "Error opening BPF object file: %s\n", strerror(errno));
+        return 1;
+    }
+
+    if (bpf_object__load(obj)) {
+        fprintf(stderr, "Error loading BPF object file: %s\n", strerror(errno));
+        return 1;
+    }
+
+    prog_fd = bpf_program__fd(bpf_object__find_program_by_title(obj, "xdp/xdp_drop_tcp_port"));
+    if (prog_fd < 0) {
+        fprintf(stderr, "Error finding program: %s\n", strerror(errno));
+        return 1;
+    }
+
+    port_map_fd = bpf_object__find_map_fd_by_name(obj, "port_map");
+    if (port_map_fd < 0) {
+        fprintf(stderr, "Error finding port_map: %s\n", strerror(errno));
+        return 1;
+    }
+
+    // Update the port_map with the new port value
+    int key = 0;
+    if (bpf_map_update_elem(port_map_fd, &key, &port, BPF_ANY)) {
+        fprintf(stderr, "Error updating port_map: %s\n", strerror(errno));
+        return 1;
+    }
+
+    if (bpf_set_link_xdp_fd(if_nametoindex(interface), prog_fd, XDP_FLAGS_UPDATE_IF_NOEXIST) < 0) {
+        fprintf(stderr, "Error attaching XDP program: %s\n", strerror(errno));
+        return 1;
+    }
+
+    printf("Successfully attached XDP program to interface %s to drop TCP packets on port %d\n", interface, port);
+
+    return 0;
+}
+Compilation and Usage
+Compile the eBPF code:
+
+sh
+Copy code
+clang -O2 -target bpf -c xdp_drop_tcp_port.c -o xdp_drop_tcp_port_kern.o
+Compile the userspace code:
+
+sh
+Copy code
+gcc -o xdp_drop_tcp_port xdp_drop_tcp_port_user.c -lbpf
+Run the program:
+
+sh
+Copy code
+sudo ./xdp_drop_tcp_port <interface> <port>
+Replace <interface> with the network interface (e.g., eth0) and <port> with the port number you want to block.
+
+This setup allows you to drop TCP packets on a specified port, and the port number can be configured from the userspace at runtime.
+
+
+
+
+Drop packets only for a given process
+<<problem statement for experienced/senior folks>>
+
+Write an eBPF code to allow traffic only at a specific TCP port (default 4040) for a given process name (for e.g, "myprocess"). All the traffic to all other ports for only that process should be dropped.
+ChatGPT
+To achieve this, we need to create an eBPF program that can filter packets based on both the destination port and the process name. This involves attaching a BPF program to the appropriate hook points and using BPF maps to store and compare the process information.
+
+eBPF Code
+We'll need a combination of XDP and BPF programs to filter packets and to access the process information.
+
+1. XDP Program to Filter Packets by Port
+First, let's create an XDP program that checks the destination port and drops the packet if it doesn't match the allowed port. This program will be attached to the XDP hook.
+
+c
+Copy code
+#include <linux/bpf.h>
+#include <linux/if_ether.h>
+#include <linux/ip.h>
+#include <linux/tcp.h>
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_tracing.h>
+#include <bpf/bpf_core_read.h>
+
+// Map to hold the allowed port number, initialized with default value 4040
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, int);
+    __type(value, __u16);
+} allowed_port_map SEC(".maps");
+
+// Map to hold the PID of the allowed process
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, int);
+    __type(value, __u32);
+} allowed_pid_map SEC(".maps");
+
+// Helper function to get the current PID
+static __always_inline __u32 get_current_pid_tgid() {
+    return bpf_get_current_pid_tgid() >> 32;
+}
+
+// XDP program to filter packets by port and process PID
+SEC("xdp")
+int xdp_filter(struct xdp_md *ctx) {
+    void *data_end = (void *)(long)ctx->data_end;
+    void *data = (void *)(long)ctx->data;
+
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end)
+        return XDP_PASS;
+
+    if (eth->h_proto != bpf_htons(ETH_P_IP))
+        return XDP_PASS;
+
+    struct iphdr *ip = data + sizeof(struct ethhdr);
+    if ((void *)(ip + 1) > data_end)
+        return XDP_PASS;
+
+    if (ip->protocol != IPPROTO_TCP)
+        return XDP_PASS;
+
+    struct tcphdr *tcp = (void *)ip + (ip->ihl * 4);
+    if ((void *)(tcp + 1) > data_end)
+        return XDP_PASS;
+
+    // Retrieve the allowed port and PID from the maps
+    int key = 0;
+    __u16 *allowed_port = bpf_map_lookup_elem(&allowed_port_map, &key);
+    if (!allowed_port)
+        return XDP_PASS;
+
+    __u32 *allowed_pid = bpf_map_lookup_elem(&allowed_pid_map, &key);
+    if (!allowed_pid)
+        return XDP_PASS;
+
+    // Get the current process PID
+    __u32 pid = get_current_pid_tgid();
+
+    // If the packet is for the allowed process and port, pass it
+    if (tcp->dest == bpf_htons(*allowed_port) && pid == *allowed_pid) {
+        return XDP_PASS;
+    }
+
+    // Otherwise, drop the packet
+    return XDP_DROP;
+}
+
+char _license[] SEC("license") = "GPL";
+Userspace Code
+The userspace code is responsible for loading the eBPF program, setting the allowed port and process PID, and attaching the program to the network interface.
+
+c
+Copy code
+#include <stdio.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/types.h>
+#include <linux/bpf.h>
+#include <bpf/libbpf.h>
+
+#define PATH_MAX 4096
+
+int get_pid_by_name(const char *name) {
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "pgrep %s", name);
+    FILE *fp = popen(cmd, "r");
+    if (!fp)
+        return -1;
+
+    int pid;
+    if (fscanf(fp, "%d", &pid) != 1) {
+        pclose(fp);
+        return -1;
+    }
+
+    pclose(fp);
+    return pid;
+}
+
+int main(int argc, char **argv) {
+    if (argc != 4) {
+        fprintf(stderr, "Usage: %s <interface> <port> <process_name>\n", argv[0]);
+        return 1;
+    }
+
+    char *interface = argv[1];
+    __u16 port = atoi(argv[2]);
+    char *process_name = argv[3];
+
+    int pid = get_pid_by_name(process_name);
+    if (pid == -1) {
+        fprintf(stderr, "Error: could not find process named %s\n", process_name);
+        return 1;
+    }
+
+    struct bpf_object *obj;
+    int prog_fd;
+    int port_map_fd, pid_map_fd;
+    char filename[PATH_MAX];
+
+    snprintf(filename, PATH_MAX, "%s_kern.o", argv[0]);
+
+    obj = bpf_object__open_file(filename, NULL);
+    if (libbpf_get_error(obj)) {
+        fprintf(stderr, "Error opening BPF object file: %s\n", strerror(errno));
+        return 1;
+    }
+
+    if (bpf_object__load(obj)) {
+        fprintf(stderr, "Error loading BPF object file: %s\n", strerror(errno));
+        return 1;
+    }
+
+    prog_fd = bpf_program__fd(bpf_object__find_program_by_title(obj, "xdp/xdp_filter"));
+    if (prog_fd < 0) {
+        fprintf(stderr, "Error finding program: %s\n", strerror(errno));
+        return 1;
+    }
+
+    port_map_fd = bpf_object__find_map_fd_by_name(obj, "allowed_port_map");
+    if (port_map_fd < 0) {
+        fprintf(stderr, "Error finding allowed_port_map: %s\n", strerror(errno));
+        return 1;
+    }
+
+    pid_map_fd = bpf_object__find_map_fd_by_name(obj, "allowed_pid_map");
+    if (pid_map_fd < 0) {
+        fprintf(stderr, "Error finding allowed_pid_map: %s\n", strerror(errno));
+        return 1;
+    }
+
+    // Update the port_map and pid_map with the allowed values
+    int key = 0;
+    if (bpf_map_update_elem(port_map_fd, &key, &port, BPF_ANY)) {
+        fprintf(stderr, "Error updating allowed_port_map: %s\n", strerror(errno));
+        return 1;
+    }
+
+    if (bpf_map_update_elem(pid_map_fd, &key, &pid, BPF_ANY)) {
+        fprintf(stderr, "Error updating allowed_pid_map: %s\n", strerror(errno));
+        return 1;
+    }
+
+    if (bpf_set_link_xdp_fd(if_nametoindex(interface), prog_fd, XDP_FLAGS_UPDATE_IF_NOEXIST) < 0) {
+        fprintf(stderr, "Error attaching XDP program: %s\n", strerror(errno));
+        return 1;
+    }
+
+    printf("Successfully attached XDP program to interface %s to allow traffic on port %d for process %s (PID %d)\n", interface, port, process_name, pid);
+
+    return 0;
+}
+Compilation and Usage
+Compile the eBPF code:
+
+sh
+Copy code
+clang -O2 -target bpf -c xdp_filter.c -o xdp_filter_kern.o
+Compile the userspace code:
+
+sh
+Copy code
+gcc -o xdp_filter xdp_filter_user.c -lbpf
+Run the program:
+
+sh
+Copy code
+sudo ./xdp_filter <interface> <port> <process_name>
+Replace <interface> with the network interface (e.g., eth0), <port> with the port number you want to allow, and <process_name> with the name of the process you want to filter traffic for.
+
+This setup ensures that only traffic to the specified port for the given process is allowed, while all other traffic for that process is dropped.
+
+
+7/7
+
+
+
+
+Explain what the following code is attempting to do? You can explain by:
+Explaining how the highlighted constructs work?
+Giving use-cases of what these constructs could be used for.
+What is the significance of the for loop with 4 iterations?
+What is the significance of make(chan func(), 10)?
+Why is “HERE1” not getting printed?
+
+package main
+
+import "fmt"
+
+func main() {
+    cnp := make(chan func(), 10)
+    for i := 0; i < 4; i++ {
+        go func() {
+            for f := range cnp {
+                f()
+            }
+        }()
+    }
+    cnp <- func() {
+        fmt.Println("HERE1")
+    }
+    fmt.Println("Hello")
+}
+
+ChatGPT
+Let's break down the code and its constructs:
+
+goroutines (go func() {...}()):
+
+The go keyword is used to start a new goroutine, which is a lightweight thread managed by the Go runtime.
+In this code, a new goroutine is started inside a loop (for i := 0; i < 4; i++) to execute a function.
+channels (make(chan func(), 10)):
+
+Channels are used for communication and synchronization between goroutines.
+The make(chan func(), 10) statement creates a buffered channel capable of holding 10 elements of type func().
+Buffered channels allow sending and receiving messages asynchronously, up to the specified capacity without blocking.
+Closure (func() {...}():
+
+A closure is a function value that references variables from outside its body.
+In this code, an anonymous function (closure) is defined and immediately executed (func() {...}()) inside the go statement.
+Range over channel (for f := range cnp {...}):
+
+The range keyword is used to iterate over elements received from a channel until it's closed.
+Inside the loop, each received function is executed (f()).
+Use-cases:
+This pattern is commonly used for concurrent processing of tasks where goroutines process work items sent through channels.
+Buffered channels are useful when you want to decouple the sender and receiver, allowing the sender to continue without waiting for the receiver to process the data.
+Significance of the for loop with 4 iterations:
+The for loop with 4 iterations starts 4 goroutines, each handling tasks sent through the channel concurrently. This allows for parallel processing of tasks, potentially improving performance by utilizing multiple CPU cores.
+
+Significance of make(chan func(), 10):
+The make(chan func(), 10) statement creates a buffered channel with a capacity of 10 functions.
+It means that the channel can hold up to 10 functions before blocking the sender. This provides a buffer for asynchronous communication between goroutines, allowing them to continue executing without immediate synchronization. 
+
+Why is “HERE1” not getting printed?
+The main goroutine sends a function to the channel cnp (cnp <- func() { fmt.Println("HERE1") }), but there are no receivers for the channel at that point. The 4 goroutines are already blocked inside the for f := range cnp loop waiting to receive functions from the channel. Hence, the function is never executed, and "HERE1" is not printed. 
+
