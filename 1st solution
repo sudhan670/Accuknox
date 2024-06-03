@@ -1,0 +1,126 @@
+// 1st ebpf code
+#include <linux/bpf.h>
+#include <linux/if_ether.h>
+#include <linux/ip.h>
+#include <linux/tcp.h>
+#include <bpf/bpf_helpers.h>
+
+// Map to hold the port number, initialized with default value 4040
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, int);
+    __type(value, __u16);
+} port_map SEC(".maps");
+
+SEC("xdp")
+int xdp_drop_tcp_port(struct xdp_md *ctx) {
+    void *data_end = (void *)(long)ctx->data_end;
+    void *data = (void *)(long)ctx->data;
+
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end)
+        return XDP_PASS;
+
+    if (eth->h_proto != bpf_htons(ETH_P_IP))
+        return XDP_PASS;
+
+    struct iphdr *ip = data + sizeof(struct ethhdr);
+    if ((void *)(ip + 1) > data_end)
+        return XDP_PASS;
+
+    if (ip->protocol != IPPROTO_TCP)
+        return XDP_PASS;
+
+    struct tcphdr *tcp = (void *)ip + (ip->ihl * 4);
+    if ((void *)(tcp + 1) > data_end)
+        return XDP_PASS;
+
+    // Retrieve the port to block from the port_map
+    int key = 0;
+    __u16 *port = bpf_map_lookup_elem(&port_map, &key);
+    if (!port)
+        return XDP_PASS;
+
+    if (tcp->dest == bpf_htons(*port)) {
+        return XDP_DROP;
+    }
+
+    return XDP_PASS;
+}
+
+char _license[] SEC("license") = "GPL"; 
+1//username code 
+#include <stdio.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <linux/bpf.h>
+#include <bpf/libbpf.h>
+
+#define PATH_MAX 4096
+
+int main(int argc, char **argv) {
+    if (argc != 3) {
+        fprintf(stderr, "Usage: %s <interface> <port>\n", argv[0]);
+        return 1;
+    }
+
+    char *interface = argv[1];
+    __u16 port = atoi(argv[2]);
+
+    struct bpf_object *obj;
+    int prog_fd;
+    int port_map_fd;
+    char filename[PATH_MAX];
+
+    snprintf(filename, PATH_MAX, "%s_kern.o", argv[0]);
+
+    obj = bpf_object__open_file(filename, NULL);
+    if (libbpf_get_error(obj)) {
+        fprintf(stderr, "Error opening BPF object file: %s\n", strerror(errno));
+        return 1;
+    }
+
+    if (bpf_object__load(obj)) {
+        fprintf(stderr, "Error loading BPF object file: %s\n", strerror(errno));
+        return 1;
+    }
+
+    prog_fd = bpf_program__fd(bpf_object__find_program_by_title(obj, "xdp/xdp_drop_tcp_port"));
+    if (prog_fd < 0) {
+        fprintf(stderr, "Error finding program: %s\n", strerror(errno));
+        return 1;
+    }
+
+    port_map_fd = bpf_object__find_map_fd_by_name(obj, "port_map");
+    if (port_map_fd < 0) {
+        fprintf(stderr, "Error finding port_map: %s\n", strerror(errno));
+        return 1;
+    }
+
+    // Update the port_map with the new port value
+    int key = 0;
+    if (bpf_map_update_elem(port_map_fd, &key, &port, BPF_ANY)) {
+        fprintf(stderr, "Error updating port_map: %s\n", strerror(errno));
+        return 1;
+    }
+
+    if (bpf_set_link_xdp_fd(if_nametoindex(interface), prog_fd, XDP_FLAGS_UPDATE_IF_NOEXIST) < 0) {
+        fprintf(stderr, "Error attaching XDP program: %s\n", strerror(errno));
+        return 1;
+    }
+
+    printf("Successfully attached XDP program to interface %s to drop TCP packets on port %d\n", interface, port);
+
+    return 0;
+}
+//compile ebf code 
+//clang -O2 -target bpf -c xdp_drop_tcp_port.c -o xdp_drop_tcp_port_kern.o 
+//compile user code 
+//gcc -o xdp_drop_tcp_port xdp_drop_tcp_port_user.c -lbpf  
+//run program 
+sudo ./xdp_drop_tcp_port <interface> <port>
+
